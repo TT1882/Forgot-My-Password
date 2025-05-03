@@ -13,7 +13,7 @@ Before installing FMP, the following must be installed on your Linux system:
 
 2. **Clone the repo:**
 ```bash
-git clone https://github.com/TT1882/Forgot-My-Password.git
+git clone https://github.com/lwilk0/Forgot-My-Password.git
 cd Forgot-My-Password
 ```
 3. **Build and install FMP with cargo:**
