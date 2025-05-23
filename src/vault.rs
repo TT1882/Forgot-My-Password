@@ -1,108 +1,193 @@
-use dirs;
-use cmd_lib::run_cmd;
-use std::{path::Path, process::exit};
+use crate::{
+    accounts::{build_accounts_file_path, read_accounts_from_file},
+    checks::vault_exists_check,
+    json::{UserPass, read_json},
+};
+use input_handle::get_string_input;
+use prettytable::{Table, row};
+use std::{
+    path::{Path, PathBuf},
+    process::{Command, exit},
+};
 
-use super::account;
-use super::json;
-
-// Finds where fmp's vault is
+// Gets vault from user, should only be called once at main
 //
 // USAGE
 //
-// let var: String = get_fmp_vault_location();
-pub fn get_fmp_vault_location() -> String{
-    // Gets users home directory
-    let home_dir = dirs::home_dir().expect("Could not find home directory!");
-    // Appends directory name to end of home directory
-    let fmp_vault_location = home_dir.join(".fmpVault");
+// let vault_location = vault_to_access();
+pub fn vault_to_access() -> PathBuf {
+    let mut vault_to_be_accessed: PathBuf =
+        get_string_input("What vault should be accessed? ").into();
 
-    return fmp_vault_location.display().to_string();
+    let mut vault_exists = vault_exists_check(&get_vault_location(&vault_to_be_accessed));
+
+    while let Err(e) = &vault_exists {
+        println!("\nError: {}\n", e);
+        vault_to_be_accessed = get_string_input("What vault should be accessed? ").into();
+        vault_exists = vault_exists_check(&get_vault_location(&vault_to_be_accessed));
+    }
+
+    println!("\n");
+
+    get_vault_location(&vault_to_be_accessed)
 }
 
-// Encrypts the .fmpVault file to .fmpVault.tar.gz.gpg
+// Finds where vault is
 //
 // USAGE
 //
-// encrypt_fmp_vault();
-
-pub fn encrypt_fmp_vault() {
-    // Gets locations
-    let fmp_vault_location = get_fmp_vault_location();
-    let fmp_vault_as_encrypted_tar = format!("{}.tar.gz.gpg", fmp_vault_location);
-    let fmp_vault_as_tar = format!("{}.tar.gz", fmp_vault_location);
-    
-    println!("Encrypting fmp vault...\n");
-    if Path::new(&fmp_vault_as_encrypted_tar).exists() {
-       run_cmd!(rm $fmp_vault_as_encrypted_tar).expect("Could not remove encrypted file");
-    }
-    // Turns .fmpVault into tarball
-    run_cmd!(tar -czf $fmp_vault_as_tar $fmp_vault_location).expect("Failed to execute command");
-    // Encrypts vault, handles incorect password
-    run_cmd!(gpg -c --no-symkey-cache $fmp_vault_as_tar).expect("Could not encrypt vault");
-    while Path::new(&fmp_vault_as_encrypted_tar).exists() == false {
-        run_cmd!(rm $fmp_vault_as_tar).expect("Could not remove file");
-        exit_vault(get_fmp_vault_location());
-    }
-    // Cleanup
-    run_cmd!(rm -r $fmp_vault_location).expect("Could not remove file");
-    run_cmd!(rm -r $fmp_vault_as_tar).expect("Could not remove file");
-
-    println!("\nEncrypted!");
+// let var: String = get_vault_location(&vault);
+pub fn get_vault_location(vault_name: &Path) -> PathBuf {
+    let home_dir = dirs::home_dir().expect("Could not find home directory!");
+    home_dir.join(format!(".{}", vault_name.display()))
 }
 
-// Decrypts the .fmpVault.tar.gz.gpg file to .fmpVault
+// Encrypts the .vault file to .vault.tar.gz.gpg
 //
 // USAGE
 //
-// decrypt_fmp_vault();
+// encrypt_vault(&vault_location);
+pub fn encrypt_vault(vault: &Path) {
+    let vault_as_encrypted_tar: PathBuf =
+        vault.with_file_name(format!("{}.tar.gz.gpg", vault.to_string_lossy()));
 
-pub fn decrypt_fmp_vault(){
-    let home_dir = dirs::home_dir().expect("Could not find home directory!");
-    let fmp_vault_location = get_fmp_vault_location();
-    let fmp_vault_as_encrypted_tar = format!("{}.tar.gz.gpg", fmp_vault_location);
-    let fmp_vault_as_tar = format!("{}.tar.gz", fmp_vault_location);
-    println!("Decrypting fmp vault...\n");
+    let vault_as_tar: PathBuf = vault.with_file_name(format!("{}.tar.gz", vault.to_string_lossy()));
 
-    // Decrypts vault, handles incorrect password
-    run_cmd!(gpg -q --no-symkey-cache $fmp_vault_as_encrypted_tar);
-    if Path::new(&fmp_vault_as_tar).exists() == false{
-        println!("Bad decrypt!");
-        exit_vault(get_fmp_vault_location());
+    println!("Encrypting vault...\n");
+
+    if Path::new(&vault_as_encrypted_tar).exists() {
+        Command::new("rm")
+            .arg(vault_as_encrypted_tar.to_string_lossy().to_string())
+            .output()
+            .expect("Could not remove encrypted file");
     }
-    // Decrypts tarball
-    run_cmd!(tar -xf $fmp_vault_as_tar -C /).expect("Failed to execute command");
-    // Removes tarball
-    run_cmd!(rm $fmp_vault_as_tar).expect("Could not remove tarball vault");
+
+    Command::new("tar")
+        .args([
+            "-czf",
+            &vault_as_tar.to_string_lossy(),
+            &vault.to_string_lossy(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    Command::new("gpg")
+        .args(["-c", "--no-symkey-cache", &vault_as_tar.to_string_lossy()])
+        .output()
+        .expect("Could not encrypt vault, please run fmp -E to encrypt");
+
+    while !vault_as_encrypted_tar.exists() {
+        encrypt_dnc(&vault_as_tar);
+    }
+
+    Command::new("rm")
+        .args(["-r", &vault_as_tar.to_string_lossy()])
+        .output()
+        .expect("Could not remove file");
+
+    Command::new("rm")
+        .args(["-r", &vault.to_string_lossy()])
+        .output()
+        .expect("Could not remove file");
+
+    println!("Encrypted!");
+}
+
+// Decrypts the .vault.tar.gz.gpg file to .vault
+//
+// USAGE
+//
+// decrypt_vault(&vault_location);
+pub fn decrypt_vault(vault: &Path) {
+    let mut attempts: u32 = 0;
+    let vault_as_encrypted_tar: PathBuf =
+        vault.with_file_name(format!("{}.tar.gz.gpg", vault.to_string_lossy()));
+
+    let vault_as_tar: PathBuf = vault.with_file_name(format!("{}.tar.gz", vault.to_string_lossy()));
+
+    println!("Decrypting vault...\n");
+
+    Command::new("gpg")
+        .args([
+            "-q",
+            "--no-symkey-cache",
+            &vault_as_encrypted_tar.to_string_lossy(),
+        ])
+        .output()
+        .expect("Could not encrypt vault");
+
+    while !Path::new(&vault_as_tar).exists() {
+        println!("Incorrect credentials! Try again.\n");
+        attempts = rate_limit(&mut attempts);
+        decrypt_dnc(&vault_as_encrypted_tar);
+    }
+
+    Command::new("tar")
+        .args(["-xf", &vault_as_tar.to_string_lossy(), "-C", "/"])
+        .output()
+        .expect("Failed to execute command");
+
+    Command::new("rm")
+        .arg(vault_as_tar.to_string_lossy().to_string())
+        .output()
+        .expect("Could not remove tarball vault");
+
     println!("Decrypted\n");
- 
 }
 
 // Reads all json files and prints to screen
 //
 // USAGE
 //
-// read_vault() 
-pub fn read_vault() {
-    // Gets list of accounts
-    let accounts_list: Vec<String> = account::read_account(account::get_account_location());
-        // Loop for each entry in accounts_list
-        for i in 0..accounts_list.len() {
-            // Find corrosponding json file and read
-            let service = accounts_list[i].clone();
-            let json = json::read_json(get_fmp_vault_location(), service);
-            // Output
-            println!("{}: Username: {} Password: {}", accounts_list[i], json.username, json.password)
+// print_vault_entries(&vault_location)
+pub fn print_vault_entries(vault: &PathBuf) {
+    let accounts = match read_accounts_from_file(&build_accounts_file_path(&vault)) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("Error reading account file: {}", e);
+            vec![]
         }
+    };
+
+    if accounts.is_empty() {
+        println!("No accounts have been created! Use fmp -a to create an account.");
+        return;
+    }
+
+    let mut table = Table::new();
+    table.add_row(row!["Account", "Username", "Password"]);
+
+    for i in 0..accounts.len() {
+        let account = accounts[i].clone();
+        let json = match read_json(vault, account) {
+            Ok(data) => data,
+            Err(e) => {
+                eprintln!("Error reading json file: {}", e);
+
+                UserPass {
+                    username: "e".to_string(),
+                    password: "e".to_string(),
+                }
+            }
+        };
+
+        table.add_row(row![accounts[i], json.username, json.password]);
+    }
+
+    table.printstd();
 }
 
 // Removes the vault folder
 //
 // USAGE
 //
-// delete_vault(get_fmp_vault_location())
-pub fn delete_vault(fmp_vault_location: String) {
-    if Path::new(&fmp_vault_location).exists() {
-        run_cmd!(rm -r $fmp_vault_location).expect("Could not remove .fmpVault");
+// delete_vault(&vault_location)
+pub fn delete_vault(vault: &PathBuf) {
+    if Path::new(&vault).exists() {
+        Command::new("rm")
+            .args(["-r", &vault.to_string_lossy()])
+            .output()
+            .expect("Could not remove .vault");
     }
 }
 
@@ -110,8 +195,79 @@ pub fn delete_vault(fmp_vault_location: String) {
 //
 // USAGE
 //
-// exit(get_fmp_vault_location())
-pub fn exit_vault(fmp_vault_location: String) {
-    delete_vault(fmp_vault_location);
+// exit(&vault_location)
+pub fn exit_vault(vault: &PathBuf) {
+    delete_vault(vault);
+
     exit(1);
+}
+
+// Encrypts the vault any tidy's files up
+//
+// USAGE
+//
+// encrypt_and_exit(&vault_location);
+pub fn encrypt_and_exit(vault: &PathBuf) {
+    encrypt_vault(vault);
+
+    delete_vault(vault);
+
+    exit_vault(vault);
+}
+
+// Removes all files related to a vault
+//
+// USAGE
+//
+// delete_vault_full(&vault_location, &vault_location_encrypted)
+pub fn delete_vault_full(vault: &Path, vault_encrypted: &Path) {
+    decrypt_vault(vault);
+
+    Command::new("rm")
+        .arg(vault_encrypted.to_string_lossy().to_string())
+        .output()
+        .expect("Failed to remove old vault");
+
+    Command::new("rm")
+        .args(["-r", &vault.to_string_lossy()])
+        .output()
+        .expect("Failed to remove old vault");
+}
+
+pub fn rate_limit(attempts: &mut u32) -> u32 {
+    *attempts += 1;
+
+    if *attempts > 3 {
+        panic!("Too many attempts! Exiting...");
+    } else {
+        attempts.clone()
+    }
+}
+
+// DO NOT CALL
+//
+// REASON
+//
+// This function is a workaround to weird behavior with gpg in while loops.
+fn decrypt_dnc(vault_as_encrypted_tar: &Path) {
+    Command::new("gpg")
+        .args([
+            "-q",
+            "--no-symkey-cache",
+            &vault_as_encrypted_tar.to_string_lossy(),
+        ])
+        .output()
+        .expect("Could not encrypt vault");
+}
+
+// DO NOT CALL
+//
+// REASON
+//
+// This function is a workaround to weird behavior with gpg in while loops.
+fn encrypt_dnc(vault_as_tar: &Path) {
+    Command::new("gpg")
+        .args(["-c", "--no-symkey-cache", &vault_as_tar.to_string_lossy()])
+        .output()
+        .expect("Could not encrypt vault, please run fmp -E to encrypt");
 }
